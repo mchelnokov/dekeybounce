@@ -28,6 +28,7 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 #define DEFAULT_MIN_TIMESTAMP_DIFF 20UL /* 20 ms */
 
@@ -38,10 +39,19 @@ typedef struct _KeyData {
 
 } KeyData;
 
+static CFMachPortRef theSignalPort = NULL;
+static CFRunLoopSourceRef theSignalSource = NULL;
+static mach_port_t theRawSignalPort = MACH_PORT_NULL;
+
 static CFMutableSetRef theKeySet = NULL;
 static CFMachPortRef theEventTap = NULL;
 static CFRunLoopSourceRef theEventTapSource = NULL;
 static CGEventTimestamp theMinTimestampDiff = 0;
+
+static Boolean InitSignalHandling(void);
+static void DeinitSignalHandling(void);
+static void SignalHandler(int nSignal);
+static void SignalCallBack(CFMachPortRef rPort, void *pMessage, CFIndex nSize, void *pInfo);
 
 static Boolean Init(void);
 static CGEventRef OnKeyEvent(CGEventTapProxy pProxy, CGEventType aEventType, CGEventRef rEvent, void *pInfo);
@@ -52,26 +62,115 @@ static void ReleaseKeyData(CFAllocatorRef rAllocator, const void *pValue);
 static Boolean IsKeyDataEqual(const void *pValue1, const void *pValue2);
 static CFHashCode KeyDataHash(const void *pValue);
 
-static void SignalHandler(int nSignal);
-
 int main (int argc, const char * argv[]) {
 
 	if(geteuid() != 0) // 0 is root
 		return 1; // incorrect using
 	if(getppid() != 1) // 1 is init
 		return 1; // incorrect using
-	signal(SIGINT, SignalHandler);
-	signal(SIGTERM, SignalHandler);
+	if(!InitSignalHandling())
+		return 1;
 	if(argc > 1)
 		theMinTimestampDiff = strtoul(argv[1], NULL, 10);
 	if(theMinTimestampDiff == 0)
 		theMinTimestampDiff = DEFAULT_MIN_TIMESTAMP_DIFF;
 	theMinTimestampDiff *= 1000000; // from ms to ns
-	if(!Init())
+	if(!Init()) {
+		DeinitSignalHandling();
 		return 1;
+	}
 	CFRunLoopRun();
 	Deinit();
+	DeinitSignalHandling();
     return 0;
+
+}
+
+static Boolean InitSignalHandling(void) {
+
+	Boolean isSuccess = FALSE;
+	do { // just for break
+		CFMachPortContext aSignalContext = { 0, NULL, NULL, NULL, NULL };
+		theSignalPort = CFMachPortCreate(NULL, SignalCallBack, &aSignalContext, NULL);
+		if(theSignalPort == NULL)
+			break;
+		theSignalSource = CFMachPortCreateRunLoopSource(NULL, theSignalPort, 0);
+		if(theSignalSource == NULL)
+			break;
+		CFRunLoopAddSource(CFRunLoopGetCurrent(), theSignalSource, kCFRunLoopDefaultMode);
+		theRawSignalPort = CFMachPortGetPort(theSignalPort);
+		struct sigaction aSignalAction;
+		bzero(&aSignalAction, sizeof aSignalAction);
+		// handled signals
+		aSignalAction.sa_handler = SignalHandler;
+		if(sigaction(SIGHUP, &aSignalAction, NULL) != 0)
+			break;
+		if(sigaction(SIGINT, &aSignalAction, NULL) != 0)
+			break;
+		if(sigaction(SIGTERM, &aSignalAction, NULL) != 0)
+			break;
+		// ignored signals
+		aSignalAction.sa_handler = SIG_IGN;
+		if(sigaction(SIGPIPE, &aSignalAction, NULL) != 0)
+			break;
+		isSuccess = TRUE;
+	} while(0);
+	if(!isSuccess) {
+		DeinitSignalHandling();
+		return FALSE;
+	}
+	return TRUE;
+	
+}
+
+static void DeinitSignalHandling(void) {
+
+	struct sigaction aSignalAction;
+	bzero(&aSignalAction, sizeof aSignalAction);
+	aSignalAction.sa_handler = SIG_DFL;
+	sigaction(SIGPIPE, &aSignalAction, NULL);
+	sigaction(SIGTERM, &aSignalAction, NULL);
+	sigaction(SIGINT, &aSignalAction, NULL);
+	sigaction(SIGHUP, &aSignalAction, NULL);
+	theRawSignalPort = MACH_PORT_NULL;
+	if(theSignalSource != NULL) {
+		CFRunLoopRemoveSource(CFRunLoopGetCurrent(), theSignalSource, kCFRunLoopDefaultMode);
+		CFRelease(theSignalSource);
+		theSignalSource = NULL;
+	}
+	if(theSignalPort != NULL) {
+		CFRelease(theSignalPort);
+		theSignalPort = NULL;
+	}
+
+}
+
+static void SignalHandler(int nSignal) {
+
+	if(theRawSignalPort == MACH_PORT_NULL)
+		return; // ignore signal since our process is being terminated
+
+	mach_msg_header_t aMachHeader;
+	aMachHeader.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
+	aMachHeader.msgh_remote_port = theRawSignalPort;
+	aMachHeader.msgh_local_port = MACH_PORT_NULL;
+	aMachHeader.msgh_size = sizeof aMachHeader;
+	aMachHeader.msgh_id = nSignal;
+	mach_msg_send(&aMachHeader); // if it will fail then that is the destiny
+
+}
+
+static void SignalCallBack(CFMachPortRef rPort, void *pMessage, CFIndex nSize, void *pInfo) {
+
+	mach_msg_header_t *pMachHeader = (mach_msg_header_t *)pMessage;
+	switch(pMachHeader->msgh_id) {
+	case SIGHUP:
+		break;
+	case SIGINT:
+	case SIGTERM:
+		CFRunLoopStop(CFRunLoopGetCurrent());
+		break;
+	}
 
 }
 
@@ -186,11 +285,5 @@ static Boolean IsKeyDataEqual(const void *pValue1, const void *pValue2) {
 static CFHashCode KeyDataHash(const void *pValue) {
 
 	return (CFHashCode)((const KeyData *)pValue)->nKeyCode;
-
-}
-
-static void SignalHandler(int nSignal) {
-
-	CFRunLoopStop(CFRunLoopGetCurrent());
 
 }
